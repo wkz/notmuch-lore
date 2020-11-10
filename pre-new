@@ -1,0 +1,109 @@
+#!/bin/sh
+
+set -e
+
+die()
+{
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+db=$(notmuch config get database.path)
+meta=$db/.notmuch
+base=$meta/.lore
+[ -d $db -a -d $meta ] || die "Please run 'notmuch setup' first."
+mkdir -p $base
+
+getvar() {
+    # From the INI file $1, get the value of key $3 in section $2.
+    awk -vsect=$2 -vvar=$3 -F= '
+    	/^\[.*\]$/ {
+		accept = $1 == "[" sect "]";
+	}
+	/=/ {
+		if (accept && $1 == var) {
+			print($2);
+			exit(0);
+		}
+        }' $1
+}
+
+import()
+{
+    local git="git --git-dir=$2"
+
+    # Make sure the Maildir exists
+    mkdir -p $db/$1/tmp -p $db/$1/new $db/$1/cur
+
+    # Extract the message from each commit in the range and store it
+    # in the Maildir for notmuch to consume.
+    $git rev-list $3 | while read sha; do
+	$git show $sha:m >$db/$1/new/$sha
+    done
+}
+
+sync()
+{
+    local gitdir=$base/git/$1
+
+    # Fetch new messages from all epochs and inject them to the
+    # corresponding Maildir.
+    for epoch in $(ls -v $gitdir/); do
+	local git="git --git-dir=$gitdir/$epoch"
+	local head=$($git rev-list -n1 master)
+
+	echo "  epoch$epoch: syncing" >&2
+	$git fetch --quiet
+	import $1 $gitdir/$epoch $head..master
+
+	# Basically we now want to `git fetch --depth=1`, but that
+	# would race against new messages that came in during the
+	# import. So instead we "manually" move the shallow boundary
+	# to HEAD, and then get rid of all objects beyond it.
+	echo $head >$gitdir/$epoch/shallow
+	$git gc --quiet --prune=all
+    done
+}
+
+initialize()
+{
+    local gitdir=$base/git/$1
+    local epoch=$(ls -v $gitdir/ | tail -n1)
+    local url=$(getvar $base/sources $1 url)
+    local since=$(getvar $base/sources $1 since)
+
+    epoch=${epoch:--1}
+    since=${since:-3 months ago}
+
+    echo "$1: initialize ($url)" >&2
+
+    # Try to fetch newer epochs until there are no more.
+    while git clone --quiet --depth 1 --mirror \
+	      $url/$(($epoch + 1)) $gitdir/$(($epoch + 1)) 2>/dev/null; do
+	epoch=$(($epoch + 1))
+
+	echo "  epoch$epoch: initial import" >&2
+	if ! git --git-dir=$gitdir/$epoch fetch --quiet \
+	     --shallow-since="$since" 2>/dev/null; then
+	    echo "    no messages in range." >&2
+	    continue
+	fi
+
+	import $1 $gitdir/$epoch master
+    done
+
+    if [ $epoch -lt 0 ]; then
+	echo "  WARN: no epochs found." >&2
+	return 1
+    fi
+}
+
+sources=$(grep -e '^\[.*\]$' <$base/sources | tr -d '[]')
+
+for source in $sources; do
+    if ! initialize $source; then
+	continue
+    fi
+
+    sync $source
+done
