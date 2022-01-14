@@ -68,7 +68,7 @@ sync()
 initialize()
 {
     local gitdir=$base/git/$1
-    local epoch=$(ls -v $gitdir/ | tail -n1)
+    local epoch=$(ls -v $gitdir/ 2>/dev/null | tail -n1)
     local url=$(getvar $base/sources $1 url)
     local since=$(getvar $base/sources $1 since)
 
